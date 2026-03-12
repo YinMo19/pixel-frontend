@@ -108,6 +108,12 @@ export interface WsPresencePayload {
 	color?: string;
 }
 
+export interface WsCursorPayload {
+	session_id: string;
+	x: number;
+	y: number;
+}
+
 export interface WsAckPayload {
 	ok: boolean;
 }

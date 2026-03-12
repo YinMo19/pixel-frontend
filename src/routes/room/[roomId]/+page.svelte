@@ -38,6 +38,7 @@
 		PixelEvent,
 		Room,
 		WsAckPayload,
+		WsCursorPayload,
 		WsEnvelope,
 		WsErrorPayload,
 		WsHelloPayload,
@@ -57,11 +58,17 @@
 	let { data }: PageProps = $props();
 
 	type ToolMode = 'brush' | 'eraser' | 'picker';
-	type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
+	type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 	interface Member {
 		session_id: string;
 		nickname: string;
 		color: string;
+	}
+	interface RemoteCursor {
+		session_id: string;
+		x: number;
+		y: number;
+		updated_at: number;
 	}
 
 	const palette = [
@@ -93,18 +100,32 @@
 	let connectionStatus = $state<ConnectionStatus>('disconnected');
 	let lastSeq = $state(0);
 	let syncing = $state(false);
+	let reconnectAttempt = $state(0);
+	let reconnectCountdownMs = $state(0);
 
 	let members = $state<Member[]>([]);
+	let remoteCursors = $state<Record<string, RemoteCursor>>({});
 	let activities = $state<string[]>(['系统：正在初始化房间连接...']);
 
 	let pixels = $state<string[]>([]);
 	const totalCells = $derived((room?.width ?? 1) * (room?.height ?? 1));
 	const paintedCount = $derived(pixels.filter((item) => item !== 'transparent').length);
 	const memberCount = $derived(members.length);
+	const activeRemoteCursors = $derived.by(() => {
+		return Object.values(remoteCursors).filter((cursor) => {
+			if (cursor.session_id === sessionId) return false;
+			return Date.now() - cursor.updated_at < 10_000;
+		});
+	});
 
 	let ws: WebSocket | null = null;
 	let pingTimer: ReturnType<typeof setInterval> | null = null;
+	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let reconnectCountdownTimer: ReturnType<typeof setInterval> | null = null;
+	let cursorCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	let requestCounter = 0;
+	let lastCursorSentAt = 0;
+	let lastCursorSentIndex: number | null = null;
 	let destroyed = false;
 
 	function toMessage(error: unknown) {
@@ -187,6 +208,53 @@
 		members = members.filter((item) => item.session_id !== sessionIdToRemove);
 	}
 
+	function findMemberBySessionId(targetSessionId: string) {
+		return members.find((item) => item.session_id === targetSessionId) ?? null;
+	}
+
+	function cursorDisplayName(targetSessionId: string) {
+		if (targetSessionId === sessionId) return nickname;
+		return findMemberBySessionId(targetSessionId)?.nickname ?? targetSessionId.slice(0, 8);
+	}
+
+	function cursorDisplayColor(targetSessionId: string) {
+		if (targetSessionId === sessionId) return profileColor;
+		return findMemberBySessionId(targetSessionId)?.color ?? '#3B82F6FF';
+	}
+
+	function setRemoteCursor(payload: WsCursorPayload) {
+		if (payload.session_id === sessionId) return;
+		if (payload.x < 0 || payload.y < 0) return;
+		if (room && (payload.x >= room.width || payload.y >= room.height)) return;
+
+		remoteCursors[payload.session_id] = {
+			session_id: payload.session_id,
+			x: payload.x,
+			y: payload.y,
+			updated_at: Date.now()
+		};
+	}
+
+	function removeRemoteCursor(targetSessionId: string) {
+		if (!remoteCursors[targetSessionId]) return;
+		delete remoteCursors[targetSessionId];
+		remoteCursors = { ...remoteCursors };
+	}
+
+	function cleanupStaleCursors() {
+		const now = Date.now();
+		let changed = false;
+		for (const [cursorSessionId, cursor] of Object.entries(remoteCursors)) {
+			if (now - cursor.updated_at > 10_000) {
+				delete remoteCursors[cursorSessionId];
+				changed = true;
+			}
+		}
+		if (changed) {
+			remoteCursors = { ...remoteCursors };
+		}
+	}
+
 	function sendFrame<TPayload>(type: string, payload: TPayload, requestId?: string) {
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 		const envelope: WsEnvelope<TPayload> = {
@@ -244,6 +312,7 @@
 				const payload = envelope.payload as WsPresencePayload;
 				if (payload.action === 'leave') {
 					removeMember(payload.session_id);
+					removeRemoteCursor(payload.session_id);
 					logActivity(`${payload.session_id.slice(0, 8)} 离开房间`);
 					break;
 				}
@@ -258,6 +327,11 @@
 				if (payload.action === 'join') {
 					logActivity(`${nextMember.nickname} 加入房间`);
 				}
+				break;
+			}
+			case 'cursor': {
+				const payload = envelope.payload as WsCursorPayload;
+				setRemoteCursor(payload);
 				break;
 			}
 			case 'ack': {
@@ -277,21 +351,82 @@
 		}
 	}
 
-	function disconnectWs() {
+	function stopPingTimer() {
 		if (pingTimer) {
 			clearInterval(pingTimer);
 			pingTimer = null;
 		}
+	}
+
+	function stopReconnectTimers() {
+		if (reconnectTimer) {
+			clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		}
+		if (reconnectCountdownTimer) {
+			clearInterval(reconnectCountdownTimer);
+			reconnectCountdownTimer = null;
+		}
+		reconnectCountdownMs = 0;
+	}
+
+	function disconnectWs(options?: { permanent?: boolean }) {
+		stopPingTimer();
+		stopReconnectTimers();
+		remoteCursors = {};
 		if (ws) {
-			ws.close();
+			const closingSocket = ws;
 			ws = null;
+			closingSocket.close();
+		}
+		if (options?.permanent) {
+			reconnectAttempt = 0;
 		}
 		connectionStatus = 'disconnected';
 	}
 
-	function connectWs() {
+	function scheduleReconnect() {
+		if (destroyed || !joinWsUrl || reconnectTimer) return;
+
+		reconnectAttempt += 1;
+		const baseDelay = Math.min(30_000, Math.round(1_000 * 2 ** (reconnectAttempt - 1)));
+		const jitter = Math.floor(Math.random() * 500);
+		const delay = baseDelay + jitter;
+
+		connectionStatus = 'reconnecting';
+		reconnectCountdownMs = delay;
+		logActivity(`WebSocket 已断开，${Math.ceil(delay / 1000)} 秒后自动重连（第 ${reconnectAttempt} 次）`);
+
+		if (reconnectCountdownTimer) {
+			clearInterval(reconnectCountdownTimer);
+		}
+		reconnectCountdownTimer = setInterval(() => {
+			reconnectCountdownMs = Math.max(0, reconnectCountdownMs - 500);
+		}, 500);
+
+		reconnectTimer = setTimeout(() => {
+			reconnectTimer = null;
+			if (reconnectCountdownTimer) {
+				clearInterval(reconnectCountdownTimer);
+				reconnectCountdownTimer = null;
+			}
+			reconnectCountdownMs = 0;
+			connectWs({ resetBackoff: false });
+		}, delay);
+	}
+
+	function connectWs(options?: { resetBackoff?: boolean }) {
 		if (!joinWsUrl) return;
-		disconnectWs();
+		stopPingTimer();
+		stopReconnectTimers();
+		if (ws) {
+			const closingSocket = ws;
+			ws = null;
+			closingSocket.close();
+		}
+		if (options?.resetBackoff !== false) {
+			reconnectAttempt = 0;
+		}
 
 		const baseUrl = resolveWsUrl(joinWsUrl);
 		const wsUrl = buildWsUrlWithParams(baseUrl, {
@@ -301,9 +436,13 @@
 		});
 
 		connectionStatus = 'connecting';
-		ws = new WebSocket(wsUrl);
+		const socket = new WebSocket(wsUrl);
+		ws = socket;
 
-		ws.onopen = () => {
+		socket.onopen = () => {
+			if (socket !== ws) return;
+			stopReconnectTimers();
+			reconnectAttempt = 0;
 			connectionStatus = 'connected';
 			requestSync(lastSeq);
 			logActivity('WebSocket 连接已建立');
@@ -312,25 +451,24 @@
 			}, 20_000);
 		};
 
-		ws.onmessage = (event) => {
+		socket.onmessage = (event) => {
+			if (socket !== ws) return;
 			if (typeof event.data === 'string') {
 				handleServerEnvelope(event.data);
 			}
 		};
 
-		ws.onerror = () => {
+		socket.onerror = () => {
+			if (socket !== ws) return;
 			logActivity('WebSocket 出现错误');
 		};
 
-		ws.onclose = () => {
-			if (pingTimer) {
-				clearInterval(pingTimer);
-				pingTimer = null;
-			}
+		socket.onclose = () => {
+			if (socket !== ws) return;
+			stopPingTimer();
+			ws = null;
 			connectionStatus = 'disconnected';
-			if (!destroyed) {
-				logActivity('WebSocket 已断开，可手动点击“重连”恢复');
-			}
+			if (!destroyed) scheduleReconnect();
 		};
 	}
 
@@ -373,6 +511,7 @@
 	async function bootstrapRoom() {
 		loading = true;
 		loadingError = '';
+		disconnectWs({ permanent: true });
 		try {
 			const profile = getStoredProfile();
 			sessionId = getOrCreateSessionId();
@@ -383,6 +522,8 @@
 
 			const roomResp = await getRoom(data.roomId);
 			room = roomResp.room;
+			members = [];
+			remoteCursors = {};
 			resetCanvas(room.width, room.height);
 
 			const joinResp = await joinRoom(room.id, {
@@ -442,14 +583,29 @@
 		);
 	}
 
+	function emitCursorFromIndex(index: number) {
+		if (!room || !ws || ws.readyState !== WebSocket.OPEN) return;
+		const now = Date.now();
+		if (lastCursorSentIndex === index && now - lastCursorSentAt < 120) return;
+		if (now - lastCursorSentAt < 60) return;
+		lastCursorSentAt = now;
+		lastCursorSentIndex = index;
+
+		const x = index % room.width;
+		const y = Math.floor(index / room.width);
+		sendFrame('cursor', { x, y });
+	}
+
 	function beginDrawing(index: number, event: PointerEvent) {
 		event.preventDefault();
 		isDrawing = true;
 		lastHoverIndex = index;
+		emitCursorFromIndex(index);
 		paintByIndex(index);
 	}
 
-	function drawWhileHover(index: number) {
+	function handleCellPointerEnter(index: number) {
+		emitCursorFromIndex(index);
 		if (!isDrawing) return;
 		if (lastHoverIndex === index) return;
 		lastHoverIndex = index;
@@ -475,17 +631,24 @@
 	}
 
 	async function leaveRoom() {
-		disconnectWs();
+		disconnectWs({ permanent: true });
 		await goto('/');
 	}
 
 	onMount(() => {
+		cursorCleanupTimer = setInterval(() => {
+			cleanupStaleCursors();
+		}, 2_000);
 		void bootstrapRoom();
 	});
 
 	onDestroy(() => {
 		destroyed = true;
-		disconnectWs();
+		if (cursorCleanupTimer) {
+			clearInterval(cursorCleanupTimer);
+			cursorCleanupTimer = null;
+		}
+		disconnectWs({ permanent: true });
 	});
 </script>
 
@@ -512,24 +675,40 @@
 						{#if room}
 							<Badge variant="secondary">{room.width}×{room.height}</Badge>
 						{/if}
-						<Badge variant={connectionStatus === 'connected' ? 'default' : 'secondary'}>
-							WS {connectionStatus}
-						</Badge>
+							<Badge
+								variant={connectionStatus === 'connected'
+									? 'default'
+									: connectionStatus === 'reconnecting'
+										? 'destructive'
+										: 'secondary'}
+							>
+								WS {connectionStatus}
+							</Badge>
+						</div>
+						<p class="text-sm text-muted-foreground">
+							昵称 {nickname} · 在线 {memberCount} 人 · 当前序列 {lastSeq}
+							{#if connectionStatus === 'reconnecting'}
+								· {Math.max(1, Math.ceil(reconnectCountdownMs / 1000))} 秒后重连
+							{/if}
+						</p>
 					</div>
-					<p class="text-sm text-muted-foreground">
-						昵称 {nickname} · 在线 {memberCount} 人 · 当前序列 {lastSeq}
-					</p>
-				</div>
 
 				<div class="flex flex-wrap items-center gap-2">
 					<Button variant="outline" size="sm" onclick={copyRoomCode} disabled={!room}>
 						<Copy class="size-4" />
 						复制房间码
 					</Button>
-					<Button variant="outline" size="sm" onclick={connectWs} disabled={!room}>
-						<RotateCw class="size-4" />
-						重连 WS
-					</Button>
+						<Button
+							variant="outline"
+							size="sm"
+							onclick={() => {
+								connectWs({ resetBackoff: true });
+							}}
+							disabled={!room}
+						>
+							<RotateCw class="size-4" />
+							重连 WS
+						</Button>
 					<Button variant="ghost" size="sm" onclick={leaveRoom}>
 						<LogOut class="size-4" />
 						离开
@@ -670,27 +849,50 @@
 					<div class="overflow-auto rounded-xl border bg-background p-4">
 						{#if room}
 							<div class="mx-auto w-fit origin-top" style={`transform: scale(${zoomPercent / 100});`}>
-								<div
-									class="grid touch-none select-none"
-									style={`grid-template-columns: repeat(${room.width}, minmax(0, 1fr)); width: ${room.width * 18}px;`}
-								>
-									{#each pixels as color, index}
-										<button
-											type="button"
-											class={`h-[18px] w-[18px] ${
-												showGrid ? 'border border-border/70' : ''
-											} ${color === 'transparent' ? 'bg-background' : ''}`}
-											style={`background-color: ${color === 'transparent' ? 'transparent' : color};`}
-											aria-label={`像素 ${index + 1}`}
-											onpointerdown={(event) => {
-												beginDrawing(index, event);
-											}}
-											onpointerenter={() => {
-												drawWhileHover(index);
-											}}
-											onpointerup={endDrawing}
-										></button>
-									{/each}
+								<div class="relative" style={`width: ${room.width * 18}px; height: ${room.height * 18}px;`}>
+									<div
+										class="grid touch-none select-none"
+										style={`grid-template-columns: repeat(${room.width}, minmax(0, 1fr)); width: ${room.width * 18}px;`}
+									>
+										{#each pixels as color, index}
+											<button
+												type="button"
+												class={`h-[18px] w-[18px] ${
+													showGrid ? 'border border-border/70' : ''
+												} ${color === 'transparent' ? 'bg-background' : ''}`}
+												style={`background-color: ${color === 'transparent' ? 'transparent' : color};`}
+												aria-label={`像素 ${index + 1}`}
+												onpointerdown={(event) => {
+													beginDrawing(index, event);
+												}}
+												onpointerenter={() => {
+													handleCellPointerEnter(index);
+												}}
+												onpointerup={endDrawing}
+											></button>
+										{/each}
+									</div>
+
+									<div class="pointer-events-none absolute inset-0 z-10">
+										{#each activeRemoteCursors as cursor (cursor.session_id)}
+											{@const memberName = cursorDisplayName(cursor.session_id)}
+											{@const memberColor = cursorDisplayColor(cursor.session_id)}
+											<div
+												class="absolute -translate-x-1/2 -translate-y-1/2"
+												style={`left: ${(cursor.x + 0.5) * 18}px; top: ${(cursor.y + 0.5) * 18}px;`}
+											>
+												<div
+													class="size-2 rounded-full border border-white shadow-sm"
+													style={`background-color: ${memberColor};`}
+												></div>
+												<div
+													class="mt-1 max-w-20 truncate rounded-sm border bg-background/90 px-1 py-0.5 text-[9px] text-foreground shadow"
+												>
+													{memberName}
+												</div>
+											</div>
+										{/each}
+									</div>
 								</div>
 							</div>
 						{:else}
