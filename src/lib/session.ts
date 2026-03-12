@@ -34,11 +34,13 @@ export function isTransparentRgba(color: string) {
 }
 
 export function getOrCreateSessionId() {
-	if (typeof localStorage === 'undefined') return crypto.randomUUID();
-	const existing = localStorage.getItem(SESSION_KEY);
+	if (typeof window === 'undefined') return crypto.randomUUID();
+
+	const storage = typeof sessionStorage !== 'undefined' ? sessionStorage : localStorage;
+	const existing = storage.getItem(SESSION_KEY);
 	if (existing && existing.trim()) return existing;
 	const created = crypto.randomUUID();
-	localStorage.setItem(SESSION_KEY, created);
+	storage.setItem(SESSION_KEY, created);
 	return created;
 }
 
