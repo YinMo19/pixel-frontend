@@ -311,9 +311,10 @@
 			case 'presence': {
 				const payload = envelope.payload as WsPresencePayload;
 				if (payload.action === 'leave') {
+					const leavingMember = findMemberBySessionId(payload.session_id);
 					removeMember(payload.session_id);
 					removeRemoteCursor(payload.session_id);
-					logActivity(`${payload.session_id.slice(0, 8)} 离开房间`);
+					logActivity(`${leavingMember?.nickname ?? payload.session_id.slice(0, 8)} 离开房间`);
 					break;
 				}
 
@@ -324,7 +325,7 @@
 				} satisfies Member;
 
 				upsertMember(nextMember);
-				if (payload.action === 'join') {
+				if (payload.action === 'join' && payload.session_id !== sessionId) {
 					logActivity(`${nextMember.nickname} 加入房间`);
 				}
 				break;
